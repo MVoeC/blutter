@@ -9,6 +9,7 @@ import subprocess
 import sys
 import zipfile
 import tempfile
+from typing import Optional
 from dartvm_fetch_build import DartLibInfo
 
 CMAKE_CMD = "cmake"
@@ -209,9 +210,9 @@ def build_and_run(input: BlutterInput):
         # execute blutter    
         subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
 
-def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, compressed_pointers: Optional[bool]):
     version, os_name, arch = dart_version.split('_')
-    dart_info = DartLibInfo(version, os_name, arch)
+    dart_info = DartLibInfo(version, os_name, arch, compressed_pointers)
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     build_and_run(input)
     
@@ -242,9 +243,11 @@ if __name__ == "__main__":
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
     # rare usage scenario
     parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64"')
+    parser.add_argument('--compressed-pointers', action='store_true', default=None, help='Force compressed pointers when running with --dart-version')
+    parser.add_argument('--no-compressed-pointers', action='store_false', dest='compressed_pointers', help='Force no compressed pointers when running with --dart-version')
     args = parser.parse_args()
 
     if args.dart_version is None:
         main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
     else:
-        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.compressed_pointers)

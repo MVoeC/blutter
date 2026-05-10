@@ -8,11 +8,15 @@ on:
         required: true
         default: "App"
       flutter_path:
-        description: "Optional Flutter/libflutter.so path for auto Dart version detection when input_path is a single App/libapp.so file"
+        description: "Optional Flutter/libflutter.so path. Leave empty/Flutter if you only have one App file."
         required: false
         default: "Flutter"
       dart_version:
-        description: "Optional Dart target, for dumping a single App/libapp.so without Flutter. Example: 3.4.2_android_arm64"
+        description: "Optional Dart target override. Example: 3.4.2_android_arm64 or 3.4.2_ios_arm64"
+        required: false
+        default: ""
+      candidate_versions:
+        description: "Optional comma-separated Dart versions to try first when only App is available. Example: 3.4.2,3.3.4,3.2.6"
         required: false
         default: ""
       out_dir:
@@ -85,6 +89,7 @@ jobs:
             build
             dartsdk
             packages
+            .dart_version_probe
           key: blutter-dump-${{ runner.os }}-${{ hashFiles('**/*.py', '**/CMakeLists.txt', '**/*.cmake') }}
           restore-keys: |
             blutter-dump-${{ runner.os }}-
@@ -96,6 +101,7 @@ jobs:
           INPUT_PATH: ${{ inputs.input_path }}
           FLUTTER_PATH: ${{ inputs.flutter_path }}
           DART_VERSION: ${{ inputs.dart_version }}
+          CANDIDATE_VERSIONS: ${{ inputs.candidate_versions }}
           OUT_DIR: ${{ inputs.out_dir }}
           NO_ANALYSIS: ${{ inputs.no_analysis }}
           REBUILD: ${{ inputs.rebuild }}
@@ -131,20 +137,52 @@ jobs:
           elif [ -d "$INPUT_PATH" ] || [[ "$INPUT_PATH" == *.apk ]]; then
             run_input="$INPUT_PATH"
           else
-            if [ ! -e "$FLUTTER_PATH" ]; then
-              {
-                echo "A single App/libapp.so file needs either:"
-                echo "  1. A matching Flutter/libflutter.so file at flutter_path, or"
-                echo "  2. A dart_version input such as 3.4.2_android_arm64."
-                echo "Current flutter_path not found: $FLUTTER_PATH"
-              } | tee "$ARTIFACT_STAGE_DIR/error.txt" >&2
-              exit 1
-            fi
+            if [ -e "$FLUTTER_PATH" ]; then
+              mkdir -p workflow_input
+              cp "$INPUT_PATH" workflow_input/App
+              cp "$FLUTTER_PATH" workflow_input/Flutter
+              run_input="workflow_input"
+            else
+              echo "Only one App/libapp file was provided; auto-detecting target metadata..."
+              resolve_log="$ARTIFACT_STAGE_DIR/resolve-single-app.log"
+              resolve_env="$ARTIFACT_STAGE_DIR/resolve-single-app.env"
+              set +e
+              python scripts/resolve_single_app.py "$INPUT_PATH" --output "$resolve_env" --versions "$CANDIDATE_VERSIONS" 2>&1 | tee "$resolve_log"
+              resolve_code=${PIPESTATUS[0]}
+              set -e
 
-            mkdir -p workflow_input
-            cp "$INPUT_PATH" workflow_input/App
-            cp "$FLUTTER_PATH" workflow_input/Flutter
-            run_input="workflow_input"
+              if [ -f "$resolve_env" ]; then
+                # shellcheck disable=SC1090
+                source "$resolve_env"
+              fi
+
+              if [ "$resolve_code" -ne 0 ]; then
+                {
+                  echo ""
+                  echo "Could not inspect this single App file."
+                  echo "Detected binary format: ${BINARY_FORMAT:-unknown}"
+                  echo "Detected target: ${TARGET_OS:-unknown} ${TARGET_ARCH:-unknown}"
+                  echo "Uploaded diagnostics: resolve-single-app.log and resolve-single-app.env"
+                } | tee "$ARTIFACT_STAGE_DIR/error.txt" >&2
+                exit 1
+              fi
+
+              run_input="$INPUT_PATH"
+              if [ -n "${DART_VERSION:-}" ]; then
+                extra_args+=("--dart-version" "$DART_VERSION")
+                echo "Auto-selected Dart target: $DART_VERSION"
+              else
+                printf 'candidate_versions=%s\n' "${CANDIDATE_DART_VERSIONS:-}" >> "$GITHUB_OUTPUT"
+                echo "No exact Dart target found; will try candidates: ${CANDIDATE_DART_VERSIONS:-<none>}"
+              fi
+              if [ "${COMPRESSED_POINTERS:-}" = "true" ]; then
+                extra_args+=("--compressed-pointers")
+                printf 'pointer_arg=%s\n' "--compressed-pointers" >> "$GITHUB_OUTPUT"
+              elif [ "${COMPRESSED_POINTERS:-}" = "false" ]; then
+                extra_args+=("--no-compressed-pointers")
+                printf 'pointer_arg=%s\n' "--no-compressed-pointers" >> "$GITHUB_OUTPUT"
+              fi
+            fi
           fi
 
           printf 'run_input=%s\n' "$run_input" >> "$GITHUB_OUTPUT"
@@ -161,7 +199,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python blutter.py "${{ steps.prepare.outputs.run_input }}" "${{ steps.prepare.outputs.out_dir }}" ${{ steps.prepare.outputs.extra_args }} 2>&1 | tee blutter-dump.log
+          run_input="${{ steps.prepare.outputs.run_input }}"
+          out_dir="${{ steps.prepare.outputs.out_dir }}"
+          candidate_versions="${{ steps.prepare.outputs.candidate_versions }}"
+          pointer_arg="${{ steps.prepare.outputs.pointer_arg }}"
+
+          if [ -n "$candidate_versions" ]; then
+            IFS=',' read -ra versions <<< "$candidate_versions"
+            success=0
+            : > blutter-dump.log
+            for version in "${versions[@]}"; do
+              version="$(echo "$version" | xargs)"
+              [ -z "$version" ] && continue
+              echo "Trying Dart target: $version" | tee -a blutter-dump.log
+              rm -rf "$out_dir"
+              mkdir -p "$out_dir"
+              set +e
+              try_args=(--dart-version "$version")
+              if [ -n "$pointer_arg" ]; then
+                try_args+=("$pointer_arg")
+              fi
+              if [ "${{ inputs.no_analysis }}" = "true" ]; then
+                try_args+=("--no-analysis")
+              fi
+              if [ "${{ inputs.rebuild }}" = "true" ]; then
+                try_args+=("--rebuild")
+              fi
+              python blutter.py "$run_input" "$out_dir" "${try_args[@]}" 2>&1 | tee -a blutter-dump.log
+              code=${PIPESTATUS[0]}
+              set -e
+              if [ "$code" -eq 0 ]; then
+                echo "$version" > "$ARTIFACT_STAGE_DIR/successful-dart-version.txt"
+                success=1
+                break
+              fi
+              echo "Dart target failed: $version" | tee -a blutter-dump.log
+            done
+            if [ "$success" -ne 1 ]; then
+              echo "All candidate Dart targets failed." | tee "$ARTIFACT_STAGE_DIR/error.txt" >&2
+              exit 1
+            fi
+          else
+            python blutter.py "$run_input" "$out_dir" ${{ steps.prepare.outputs.extra_args }} 2>&1 | tee blutter-dump.log
+          fi
 
       - name: Stage dump artifact files
         if: always()

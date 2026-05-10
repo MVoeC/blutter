@@ -2,10 +2,6 @@
 #include "ElfHelper.h"
 PRAGMA_WARNING(push, 0)
 #include <platform/elf.h>
-#if defined(DART_TARGET_OS_MACOS)
-// old dart version has no mach_o.h
-//#include <platform/mach_o.h>
-#endif
 PRAGMA_WARNING(pop)
 #include <algorithm>
 #include <stdexcept>
@@ -28,6 +24,78 @@ struct ElfIdent {
 	uint8_t ei_abiversion;
 	uint8_t pad1[7];
 };
+
+namespace mach_o {
+constexpr uint32_t MH_MAGIC_64 = 0xfeedfacf;
+constexpr uint32_t LC_SEGMENT_64 = 0x19;
+constexpr uint32_t LC_SYMTAB = 0x2;
+constexpr uint32_t N_STAB = 0xe0;
+constexpr uint32_t N_TYPE = 0x0e;
+constexpr uint32_t N_SECT = 0x0e;
+constexpr uint32_t MAX_SEGMENTS = 64;
+
+struct mach_header_64 {
+	uint32_t magic;
+	int32_t cputype;
+	int32_t cpusubtype;
+	uint32_t filetype;
+	uint32_t ncmds;
+	uint32_t sizeofcmds;
+	uint32_t flags;
+	uint32_t reserved;
+};
+
+struct load_command {
+	uint32_t cmd;
+	uint32_t cmdsize;
+};
+
+struct segment_command_64 {
+	uint32_t cmd;
+	uint32_t cmdsize;
+	char segname[16];
+	uint64_t vmaddr;
+	uint64_t vmsize;
+	uint64_t fileoff;
+	uint64_t filesize;
+	int32_t maxprot;
+	int32_t initprot;
+	uint32_t nsects;
+	uint32_t flags;
+};
+
+struct section_64 {
+	char sectname[16];
+	char segname[16];
+	uint64_t addr;
+	uint64_t size;
+	uint32_t offset;
+	uint32_t align;
+	uint32_t reloff;
+	uint32_t nreloc;
+	uint32_t flags;
+	uint32_t reserved1;
+	uint32_t reserved2;
+	uint32_t reserved3;
+};
+
+struct symtab_command {
+	uint32_t cmd;
+	uint32_t cmdsize;
+	uint32_t symoff;
+	uint32_t nsyms;
+	uint32_t stroff;
+	uint32_t strsize;
+};
+
+struct nlist_64 {
+	uint32_t n_strx;
+	uint8_t n_type;
+	uint8_t n_sect;
+	uint16_t n_desc;
+	uint64_t n_value;
+};
+} // namespace mach_o
 
 using namespace dart::elf;
 
@@ -147,45 +215,110 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
 	};
 }
 
+static const uint8_t* macho_addr_to_ptr(const uint8_t* lib, const mach_o::segment_command_64* segments[64], uint32_t segment_count, uint64_t addr)
+{
+	for (uint32_t i = 0; i < segment_count; i++) {
+		const auto* seg = segments[i];
+		if (addr >= seg->vmaddr && addr < seg->vmaddr + seg->vmsize) {
+			return lib + seg->fileoff + (addr - seg->vmaddr);
+		}
+	}
+	return nullptr;
+}
+
+static LibAppInfo findSnapshotsMachO(const uint8_t* lib)
+{
+	const auto* header = (const mach_o::mach_header_64*)lib;
+	if (header->magic != mach_o::MH_MAGIC_64)
+		throw std::invalid_argument("Mach-O: Invalid magic header");
+
+	const mach_o::symtab_command* symtab = nullptr;
+	const mach_o::segment_command_64* segments[mach_o::MAX_SEGMENTS]{};
+	uint32_t segment_count = 0;
+	const uint8_t* lc_ptr = lib + sizeof(mach_o::mach_header_64);
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		const auto* lc = (const mach_o::load_command*)lc_ptr;
+		if (lc->cmd == mach_o::LC_SYMTAB) {
+			symtab = (const mach_o::symtab_command*)lc_ptr;
+		}
+		else if (lc->cmd == mach_o::LC_SEGMENT_64 && segment_count < mach_o::MAX_SEGMENTS) {
+			segments[segment_count++] = (const mach_o::segment_command_64*)lc_ptr;
+		}
+		lc_ptr += lc->cmdsize;
+	}
+
+	if (symtab == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find symbol table");
+
+	const auto* symbols = (const mach_o::nlist_64*)(lib + symtab->symoff);
+	const char* strings = (const char*)lib + symtab->stroff;
+	const uint8_t* vm_snapshot_data = nullptr;
+	const uint8_t* vm_snapshot_instructions = nullptr;
+	const uint8_t* isolate_snapshot_data = nullptr;
+	const uint8_t* isolate_snapshot_instructions = nullptr;
+
+	for (uint32_t i = 0; i < symtab->nsyms; i++) {
+		const auto& sym = symbols[i];
+		if ((sym.n_type & mach_o::N_STAB) != 0 || (sym.n_type & mach_o::N_TYPE) != mach_o::N_SECT || sym.n_strx == 0 || sym.n_strx >= symtab->strsize)
+			continue;
+
+		const char* name = strings + sym.n_strx;
+		const uint8_t* ptr = macho_addr_to_ptr(lib, segments, segment_count, sym.n_value);
+		if (ptr == nullptr)
+			continue;
+
+		if (strcmp(name, kVmSnapshotDataAsmSymbol) == 0) {
+			vm_snapshot_data = ptr;
+		}
+		else if (strcmp(name, kVmSnapshotInstructionsAsmSymbol) == 0) {
+			vm_snapshot_instructions = ptr;
+		}
+		else if (strcmp(name, kIsolateSnapshotDataAsmSymbol) == 0) {
+			isolate_snapshot_data = ptr;
+		}
+		else if (strcmp(name, kIsolateSnapshotInstructionsAsmSymbol) == 0) {
+			isolate_snapshot_instructions = ptr;
+		}
+	}
+
+	if (vm_snapshot_data == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart VM Snapshot Data");
+	if (vm_snapshot_instructions == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart VM Snapshot Instructions");
+	if (isolate_snapshot_data == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart Isolate Snapshot Data");
+	if (isolate_snapshot_instructions == nullptr)
+		throw std::invalid_argument("Mach-O: Cannot find Dart Isolate Snapshot Instructions");
+
+	return LibAppInfo{
+		.lib = lib,
+		.vm_snapshot_data = vm_snapshot_data,
+		.vm_snapshot_instructions = vm_snapshot_instructions,
+		.isolate_snapshot_data = isolate_snapshot_data,
+		.isolate_snapshot_instructions = isolate_snapshot_instructions,
+	};
+}
+
 LibAppInfo ElfHelper::MapLibAppSo(const char* path)
 {
 	void* lib = load_map_file(path);
-	// quick and dirty parsing ELF to get symbol addresses
 	uint8_t* elf = (uint8_t*)(lib);
-#if defined(DART_TARGET_OS_MACOS)
-	// Note: only new dart version getting snapshots from load command
-	// <=2.17, use EXPORT name
-	// <= v2.18,  load from sub SEGMENT_64, named "__CUSTOM" and section named "__dart_app_snap"
-	// >= 2.19, LC_NOTE command is used
-	auto header = (dart::mach_o::mach_header_64*)lib;
-	switch (header->magic) {
-	case dart::mach_o::MH_MAGIC:
-	case dart::mach_o::MH_CIGAM:
-		throw std::invalid_argument("Mach-O: Support only 64 bits");
-	case dart::mach_o::MH_CIGAM_64:
-		throw std::invalid_argument("Mach-O: Expected a host endian header");
-	case dart::mach_o::MH_MAGIC_64:
-		return size >= sizeof(mach_o::mach_header_64);
-	default:
-		throw std::invalid_argument("Mach-O: Invalid magic header");
-	}
-#else
 	const auto* hdr = (ElfHeader*)elf;
 	const auto* ident = (ElfIdent*)hdr->ident;
-	if (memcmp(ident->ei_magic, "\x7f" "ELF", 4) != 0)
-		throw std::invalid_argument("ELF: Invalid magic header"); // need ELF file
-	if (ident->ei_data != 1)
-		throw std::invalid_argument("ELF: Support only little endian"); // expect little-endian
+	if (memcmp(ident->ei_magic, "\x7f" "ELF", 4) == 0) {
+		if (ident->ei_data != 1)
+			throw std::invalid_argument("ELF: Support only little endian"); // expect little-endian
 
-	if (ident->ei_class != ELFCLASS64) { // 1 is 32 bits, 2 is 64 bits
-		throw std::invalid_argument("ELF: Support only 64 bits"); // support only 64 bits
+		if (ident->ei_class != ELFCLASS64) { // 1 is 32 bits, 2 is 64 bits
+			throw std::invalid_argument("ELF: Support only 64 bits"); // support only 64 bits
+		}
+		return findSnapshots(elf);
 	}
-	// expected e_machine
-	//   3: x86, 0x28: ARM
-	//   0x3e: x86-64, 0xB7: Aarch64
-	// EM_386, EM_ARM, EM_X86_64, EM_AARCH64
-	//hdr->e_machine;
-#endif
 
-	return findSnapshots(elf);
+	const auto* macho_header = (const mach_o::mach_header_64*)lib;
+	if (macho_header->magic == mach_o::MH_MAGIC_64) {
+		return findSnapshotsMachO((const uint8_t*)lib);
+	}
+
+	throw std::invalid_argument("Unsupported file format: expected ELF or 64-bit little-endian Mach-O");
 }
