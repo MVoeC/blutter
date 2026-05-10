@@ -1,0 +1,168 @@
+name: Dump Flutter App
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_path:
+        description: "Path to APK, lib directory, libapp.so, or App file in this repository"
+        required: true
+        default: "App"
+      flutter_path:
+        description: "Optional Flutter/libflutter.so path for auto Dart version detection when input_path is a single App/libapp.so file"
+        required: false
+        default: "Flutter"
+      dart_version:
+        description: "Optional Dart target, for dumping a single App/libapp.so without Flutter. Example: 3.4.2_android_arm64"
+        required: false
+        default: ""
+      out_dir:
+        description: "Dump output directory"
+        required: true
+        default: "dump_out"
+      no_analysis:
+        description: "Build without code analysis for faster/more compatible dumps"
+        required: true
+        type: boolean
+        default: false
+      rebuild:
+        description: "Force rebuild blutter executable"
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  dump-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3-pyelftools \
+            python3-requests \
+            git \
+            cmake \
+            ninja-build \
+            build-essential \
+            pkg-config \
+            libicu-dev \
+            libcapstone-dev
+          python -m pip install --upgrade pip
+          python -m pip install requests pyelftools
+          cmake --version
+          ninja --version
+          python --version
+          g++ --version
+
+      - name: Cache blutter build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin
+            build
+            dartsdk
+            packages
+          key: blutter-dump-${{ runner.os }}-${{ hashFiles('**/*.py', '**/CMakeLists.txt', '**/*.cmake') }}
+          restore-keys: |
+            blutter-dump-${{ runner.os }}-
+
+      - name: Prepare input
+        id: prepare
+        shell: bash
+        env:
+          INPUT_PATH: ${{ inputs.input_path }}
+          FLUTTER_PATH: ${{ inputs.flutter_path }}
+          DART_VERSION: ${{ inputs.dart_version }}
+          OUT_DIR: ${{ inputs.out_dir }}
+          NO_ANALYSIS: ${{ inputs.no_analysis }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -e "$INPUT_PATH" ]; then
+            echo "Input path does not exist: $INPUT_PATH" >&2
+            echo "Commit the App/APK/lib files to this repository, or update input_path when manually running this workflow." >&2
+            exit 1
+          fi
+
+          rm -rf "$OUT_DIR" workflow_input
+          mkdir -p "$OUT_DIR"
+
+          extra_args=()
+          if [ "$NO_ANALYSIS" = "true" ]; then
+            extra_args+=("--no-analysis")
+          fi
+          if [ "$REBUILD" = "true" ]; then
+            extra_args+=("--rebuild")
+          fi
+
+          if [ -n "$DART_VERSION" ]; then
+            run_input="$INPUT_PATH"
+            extra_args+=("--dart-version" "$DART_VERSION")
+          elif [ -d "$INPUT_PATH" ] || [[ "$INPUT_PATH" == *.apk ]]; then
+            run_input="$INPUT_PATH"
+          else
+            if [ ! -e "$FLUTTER_PATH" ]; then
+              echo "A single App/libapp.so file needs either:" >&2
+              echo "  1. A matching Flutter/libflutter.so file at flutter_path, or" >&2
+              echo "  2. A dart_version input such as 3.4.2_android_arm64." >&2
+              echo "Current flutter_path not found: $FLUTTER_PATH" >&2
+              exit 1
+            fi
+
+            mkdir -p workflow_input
+            cp "$INPUT_PATH" workflow_input/App
+            cp "$FLUTTER_PATH" workflow_input/Flutter
+            run_input="workflow_input"
+          fi
+
+          printf 'run_input=%s\n' "$run_input" >> "$GITHUB_OUTPUT"
+          printf 'out_dir=%s\n' "$OUT_DIR" >> "$GITHUB_OUTPUT"
+          printf 'extra_args<<EOF\n' >> "$GITHUB_OUTPUT"
+          printf '%q ' "${extra_args[@]}" >> "$GITHUB_OUTPUT"
+          printf '\nEOF\n' >> "$GITHUB_OUTPUT"
+
+          echo "Prepared input: $run_input"
+          echo "Output dir: $OUT_DIR"
+          echo "Extra args: ${extra_args[*]:-<none>}"
+
+      - name: Dump App
+        shell: bash
+        run: |
+          set -euo pipefail
+          python blutter.py "${{ steps.prepare.outputs.run_input }}" "${{ steps.prepare.outputs.out_dir }}" ${{ steps.prepare.outputs.extra_args }} 2>&1 | tee blutter-dump.log
+
+      - name: List dump files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Dump output tree:"
+          if [ -d "${{ steps.prepare.outputs.out_dir }}" ]; then
+            find "${{ steps.prepare.outputs.out_dir }}" -maxdepth 3 -type f | sort | sed 's#^#  #'
+          else
+            echo "  Output directory was not created."
+          fi
+
+      - name: Upload dump artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blutter-dump-${{ github.run_number }}
+          path: |
+            ${{ steps.prepare.outputs.out_dir }}/
+            blutter-dump.log
+          if-no-files-found: warn
+          retention-days: 14
