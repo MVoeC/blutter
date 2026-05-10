@@ -30,6 +30,10 @@ on:
         type: boolean
         default: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  ARTIFACT_STAGE_DIR: ".dump_artifacts"
+
 jobs:
   dump-app:
     runs-on: ubuntu-latest
@@ -38,6 +42,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Initialize artifact staging directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$ARTIFACT_STAGE_DIR"
+          mkdir -p "$ARTIFACT_STAGE_DIR"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -91,9 +102,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "$OUT_DIR" ]; then
+            OUT_DIR="dump_out"
+          fi
+
           if [ ! -e "$INPUT_PATH" ]; then
-            echo "Input path does not exist: $INPUT_PATH" >&2
-            echo "Commit the App/APK/lib files to this repository, or update input_path when manually running this workflow." >&2
+            {
+              echo "Input path does not exist: $INPUT_PATH"
+              echo "Commit the App/APK/lib files to this repository, or update input_path when manually running this workflow."
+            } | tee "$ARTIFACT_STAGE_DIR/error.txt" >&2
             exit 1
           fi
 
@@ -115,10 +132,12 @@ jobs:
             run_input="$INPUT_PATH"
           else
             if [ ! -e "$FLUTTER_PATH" ]; then
-              echo "A single App/libapp.so file needs either:" >&2
-              echo "  1. A matching Flutter/libflutter.so file at flutter_path, or" >&2
-              echo "  2. A dart_version input such as 3.4.2_android_arm64." >&2
-              echo "Current flutter_path not found: $FLUTTER_PATH" >&2
+              {
+                echo "A single App/libapp.so file needs either:"
+                echo "  1. A matching Flutter/libflutter.so file at flutter_path, or"
+                echo "  2. A dart_version input such as 3.4.2_android_arm64."
+                echo "Current flutter_path not found: $FLUTTER_PATH"
+              } | tee "$ARTIFACT_STAGE_DIR/error.txt" >&2
               exit 1
             fi
 
@@ -144,25 +163,31 @@ jobs:
           set -euo pipefail
           python blutter.py "${{ steps.prepare.outputs.run_input }}" "${{ steps.prepare.outputs.out_dir }}" ${{ steps.prepare.outputs.extra_args }} 2>&1 | tee blutter-dump.log
 
-      - name: List dump files
+      - name: Stage dump artifact files
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          echo "Dump output tree:"
-          if [ -d "${{ steps.prepare.outputs.out_dir }}" ]; then
-            find "${{ steps.prepare.outputs.out_dir }}" -maxdepth 3 -type f | sort | sed 's#^#  #'
-          else
-            echo "  Output directory was not created."
+          mkdir -p "$ARTIFACT_STAGE_DIR"
+
+          if [ -f blutter-dump.log ]; then
+            cp blutter-dump.log "$ARTIFACT_STAGE_DIR/"
           fi
+
+          out_dir="${{ steps.prepare.outputs.out_dir }}"
+          if [ -n "$out_dir" ] && [ -d "$out_dir" ]; then
+            mkdir -p "$ARTIFACT_STAGE_DIR/output"
+            cp -a "$out_dir/." "$ARTIFACT_STAGE_DIR/output/"
+          fi
+
+          echo "Artifact staging tree:"
+          find "$ARTIFACT_STAGE_DIR" -maxdepth 4 -type f | sort | sed 's#^#  #'
 
       - name: Upload dump artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: blutter-dump-${{ github.run_number }}
-          path: |
-            ${{ steps.prepare.outputs.out_dir }}/
-            blutter-dump.log
+          path: .dump_artifacts/
           if-no-files-found: warn
           retention-days: 14
